@@ -220,11 +220,28 @@ impl ProxyHttp for SolanaGrpcProxy {
             return Ok(false);
         };
 
-        // Read the first body chunk (initial SubscribeRequest protobuf)
-        let first_chunk: Option<Bytes> = session
-            .downstream_session
-            .read_request_body()
-            .await?;
+        // Read the first body chunk (initial SubscribeRequest protobuf) with
+        // a short timeout. Some gRPC clients don't send a DATA frame until
+        // they receive the initial server response, so we can't block forever.
+        // If no body arrives within the timeout, allow the request to proceed
+        // and fall through to regular request_body_filter (which won't
+        // validate — this is a best-effort guard).
+        let read_fut = session.downstream_session.read_request_body();
+        let first_chunk = match tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            read_fut,
+        )
+        .await
+        {
+            Ok(Ok(chunk)) => chunk,
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                // Timeout — client isn't sending body before server response.
+                // Allow upstream to proceed without validation.
+                tracing::debug!(client_ip = %ctx.client_ip, "body not available before upstream, skipping validation");
+                return Ok(false);
+            }
+        };
         let Some(chunk) = first_chunk else {
             return Ok(false);
         };
