@@ -160,17 +160,29 @@ impl Session {
     /// Informational headers (status code 100-199, excluding 101) can be written multiple times the final
     /// response header (status code 200+ or 101) is written.
     pub async fn write_response_header(&mut self, resp: Box<ResponseHeader>) -> Result<()> {
+        self.write_response_header_with_end(resp, false).await
+    }
+
+    /// Write the response header with an explicit end_of_stream flag.
+    /// For HTTP/2, if `end_of_stream=true`, this sends a HEADERS frame with
+    /// the END_STREAM flag, producing a trailers-only response (used for
+    /// gRPC errors).
+    pub async fn write_response_header_with_end(
+        &mut self,
+        resp: Box<ResponseHeader>,
+        end_of_stream: bool,
+    ) -> Result<()> {
         match self {
             Self::H1(s) => {
                 s.write_response_header(resp).await?;
                 Ok(())
             }
-            Self::H2(s) => s.write_response_header(resp, false),
+            Self::H2(s) => s.write_response_header(resp, end_of_stream),
             Self::Subrequest(s) => {
                 s.write_response_header(resp).await?;
                 Ok(())
             }
-            Self::Custom(s) => s.write_response_header(resp, false).await,
+            Self::Custom(s) => s.write_response_header(resp, end_of_stream).await,
         }
     }
 

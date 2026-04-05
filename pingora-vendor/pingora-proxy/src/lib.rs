@@ -552,7 +552,9 @@ impl Session {
         self.downstream_modules_ctx
             .response_header_filter(&mut resp, end_of_stream)
             .await?;
-        self.downstream_session.write_response_header(resp).await
+        self.downstream_session
+            .write_response_header_with_end(resp, end_of_stream)
+            .await
     }
 
     /// Similar to `write_response_header()`, this fn will clone the `resp` internally
