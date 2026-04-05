@@ -32,6 +32,14 @@ max = 10
 [entry]
 max = 10
 
+# Per-stream subscription churn protection.
+# Limits how often a client can send new/updated SubscribeRequest in a
+# single stream. Protects upstream from rapid filter-switching abuse.
+# 0 = no limit.
+[churn]
+max_updates = 20       # max SubscribeRequest messages per window
+window_secs = 10       # sliding window length in seconds
+
 [transactions_status]
 account_include_max = 20
 account_exclude_max = 20

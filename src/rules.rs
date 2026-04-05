@@ -42,6 +42,11 @@ pub struct FilterRules {
     pub transactions_status: TransactionsLimits,
     pub blocks_meta_max: i64,
     pub entry_max: i64,
+    /// Maximum number of SubscribeRequest updates per stream within
+    /// `churn_window_secs`. 0 = no limit.
+    pub max_updates_per_window: i64,
+    /// Time window (seconds) for churn protection. Default 10s.
+    pub churn_window_secs: i64,
 }
 
 fn get_sub_table<'a>(conf: &'a TomlTable, key: &str) -> Option<&'a TomlTable> {
@@ -121,6 +126,12 @@ impl FilterRules {
             entry_max: get_sub_table(conf, "entry")
                 .map(|t| sub_int(Some(t), "max", 0))
                 .unwrap_or(0),
+            max_updates_per_window: get_sub_table(conf, "churn")
+                .map(|t| sub_int(Some(t), "max_updates", 0))
+                .unwrap_or(0),
+            churn_window_secs: get_sub_table(conf, "churn")
+                .map(|t| sub_int(Some(t), "window_secs", 10))
+                .unwrap_or(10),
         }
     }
 }

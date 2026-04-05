@@ -239,6 +239,54 @@ async fn test_4_empty_then_rejected(args: &Args) -> Result<()> {
     Ok(())
 }
 
+async fn test_6_churn_attack(args: &Args) -> Result<()> {
+    println!("\n=== Test 6: Rapid subscription updates (churn attack) ===");
+    let mut client = GeyserClient::connect(args.endpoint.clone()).await?;
+    let (tx, rx) = tokio::sync::mpsc::channel(64);
+
+    // Send first valid request
+    tx.send(make_request(vec![args.allowed.clone()])).await?;
+
+    let req = tokio_stream::wrappers::ReceiverStream::new(rx);
+    let mut resp = client.subscribe(req).await?;
+    let stream = resp.get_mut();
+
+    // Fire 30 rapid update messages
+    println!("  -> sending 30 rapid SubscribeRequest updates");
+    for _ in 0..30 {
+        tx.send(make_request(vec![args.allowed.clone()])).await?;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // Wait for reject or confirm no reject happened
+    let mut got_reject = false;
+    let start = std::time::Instant::now();
+    while start.elapsed() < Duration::from_secs(5) {
+        match tokio::time::timeout(Duration::from_millis(500), stream.next()).await {
+            Ok(Some(Ok(_))) => continue,
+            Ok(Some(Err(status))) => {
+                if status.code() == Code::ResourceExhausted {
+                    println!("  ✅ PASS: churn limit enforced — {}", status.message());
+                } else {
+                    println!("  ⚠  rejected with unexpected code {:?}: {}", status.code(), status.message());
+                }
+                got_reject = true;
+                break;
+            }
+            Ok(None) => {
+                println!("  ✅ PASS: stream closed");
+                got_reject = true;
+                break;
+            }
+            Err(_) => continue,
+        }
+    }
+    if !got_reject {
+        println!("  ⚠  no reject after 30 rapid updates — churn protection may be disabled in rules");
+    }
+    Ok(())
+}
+
 async fn test_5_valid_allowed(args: &Args) -> Result<()> {
     println!("\n=== Test 5: Valid subscription (should work) ===");
     let mut client = GeyserClient::connect(args.endpoint.clone()).await?;
@@ -306,6 +354,11 @@ async fn main() -> Result<()> {
     if run_all || args.test == 5 {
         if let Err(e) = test_5_valid_allowed(&args).await {
             println!("  test 5 errored: {e:#}");
+        }
+    }
+    if run_all || args.test == 6 {
+        if let Err(e) = test_6_churn_attack(&args).await {
+            println!("  test 6 errored: {e:#}");
         }
     }
 

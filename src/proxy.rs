@@ -36,6 +36,11 @@ pub struct RequestCtx {
     /// validate it. Every SubscribeRequest in the stream is validated —
     /// no early-exit.
     pub pending_frame: bytes::BytesMut,
+    /// Per-stream churn counter: number of SubscribeRequest updates
+    /// received within the current churn window.
+    pub churn_count: u32,
+    /// When the current churn window started (None = no updates yet).
+    pub churn_window_start: Option<std::time::Instant>,
 }
 
 impl Default for RequestCtx {
@@ -46,6 +51,8 @@ impl Default for RequestCtx {
             guard: None,
             response_sent: false,
             pending_frame: bytes::BytesMut::new(),
+            churn_count: 0,
+            churn_window_start: None,
         }
     }
 }
@@ -359,6 +366,47 @@ impl ProxyHttp for SolanaGrpcProxy {
                     &msg,
                 )
                 .await;
+            }
+
+            // Per-stream churn protection: limit how often a client can
+            // update their subscription within a sliding window.
+            if rules.max_updates_per_window > 0 {
+                let now = std::time::Instant::now();
+                let window = std::time::Duration::from_secs(rules.churn_window_secs.max(1) as u64);
+                match ctx.churn_window_start {
+                    None => {
+                        ctx.churn_window_start = Some(now);
+                        ctx.churn_count = 1;
+                    }
+                    Some(start) if now.duration_since(start) >= window => {
+                        // Reset window
+                        ctx.churn_window_start = Some(now);
+                        ctx.churn_count = 1;
+                    }
+                    Some(_) => {
+                        ctx.churn_count += 1;
+                        if ctx.churn_count as i64 > rules.max_updates_per_window {
+                            tracing::warn!(
+                                client_ip = %ctx.client_ip,
+                                count = ctx.churn_count,
+                                max = rules.max_updates_per_window,
+                                window_secs = rules.churn_window_secs,
+                                "subscription churn limit exceeded"
+                            );
+                            return reject_body(
+                                session,
+                                ctx,
+                                body,
+                                GRPC_STATUS_RESOURCE_EXHAUSTED,
+                                &format!(
+                                    "subscription churn limit: {} updates in {}s",
+                                    ctx.churn_count, rules.churn_window_secs
+                                ),
+                            )
+                            .await;
+                        }
+                    }
+                }
             }
 
             // Consume the validated frame from the buffer
