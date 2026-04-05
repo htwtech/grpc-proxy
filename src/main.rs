@@ -7,6 +7,7 @@ mod validator;
 
 use clap::Parser;
 use config::Config;
+use pingora::apps::HttpServerOptions;
 use pingora::prelude::*;
 use proxy::SolanaGrpcProxy;
 
@@ -58,6 +59,14 @@ fn main() {
 
     let listen_addr = config.listen.clone();
     let mut service = http_proxy_service(&server.configuration, proxy);
+
+    // Enable h2c (HTTP/2 cleartext) — required for gRPC without TLS
+    if let Some(http_logic) = service.app_logic_mut() {
+        let mut http_server_options = HttpServerOptions::default();
+        http_server_options.h2c = true;
+        http_logic.server_options = Some(http_server_options);
+    }
+
     service.add_tcp(&listen_addr);
 
     server.add_service(service);
