@@ -1,0 +1,30 @@
+[package]
+name = "solana-grpc-proxy"
+version = "0.1.0"
+edition = "2021"
+description = "Minimal Pingora-based gRPC proxy for Solana Yellowstone/Geyser with per-IP SubscribeRequest filtering"
+license = "Apache-2.0"
+
+[dependencies]
+pingora = { version = "0.8.0", features = ["lb", "openssl"] }
+pingora-limits = "0.8.0"
+async-trait = "0.1"
+tokio = { version = "1", features = ["full"] }
+bytes = "1"
+http = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+toml = "0.9"
+serde = { version = "1", features = ["derive"] }
+humantime = "2"
+clap = { version = "4", features = ["derive"] }
+
+[profile.release]
+codegen-units = 1
+lto = true
+strip = true
+
+[profile.release-perf]
+inherits = "release"
+debug = 1
+strip = "none"
