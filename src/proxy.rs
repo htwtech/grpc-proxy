@@ -27,11 +27,10 @@ const SUBSCRIBE_PATH: &str = "/geyser.Geyser/Subscribe";
 pub struct RequestCtx {
     pub client_ip: String,
     pub rules: Option<Arc<FilterRules>>,
+    #[allow(dead_code)]
     pub guard: Option<Guard>,
     /// True if we already wrote a response and the request should terminate
     pub response_sent: bool,
-    /// Body chunk read in pre_upstream_body_filter, re-injected in request_body_filter
-    pub buffered_body: Option<Bytes>,
     /// True when we've already validated (or decided to skip validation of)
     /// the first body chunk — prevents re-validating ping messages or
     /// subsequent SubscribeRequest updates on the same stream.
@@ -45,7 +44,6 @@ impl Default for RequestCtx {
             rules: None,
             guard: None,
             response_sent: false,
-            buffered_body: None,
             late_validation_done: false,
         }
     }
