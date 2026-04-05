@@ -251,18 +251,25 @@ async fn test_6_churn_attack(args: &Args) -> Result<()> {
     let mut resp = client.subscribe(req).await?;
     let stream = resp.get_mut();
 
-    // Fire 30 rapid update messages
-    println!("  -> sending 30 rapid SubscribeRequest updates");
-    for _ in 0..30 {
-        tx.send(make_request(vec![args.allowed.clone()])).await?;
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    // Spawn a concurrent sender task so we can listen to the stream
+    // in parallel and catch the reject as soon as it arrives.
+    let allowed = args.allowed.clone();
+    let sender = tokio::spawn(async move {
+        for _ in 0..30 {
+            if tx.send(make_request(vec![allowed.clone()])).await.is_err() {
+                break; // receiver closed
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    });
 
-    // Wait for reject or confirm no reject happened
+    println!("  -> sending 30 rapid SubscribeRequest updates (concurrent)");
+
+    // Listen for reject while sender is running
     let mut got_reject = false;
     let start = std::time::Instant::now();
-    while start.elapsed() < Duration::from_secs(5) {
-        match tokio::time::timeout(Duration::from_millis(500), stream.next()).await {
+    while start.elapsed() < Duration::from_secs(8) {
+        match tokio::time::timeout(Duration::from_millis(200), stream.next()).await {
             Ok(Some(Ok(_))) => continue,
             Ok(Some(Err(status))) => {
                 if status.code() == Code::ResourceExhausted {
@@ -281,6 +288,7 @@ async fn test_6_churn_attack(args: &Args) -> Result<()> {
             Err(_) => continue,
         }
     }
+    let _ = sender.await;
     if !got_reject {
         println!("  ⚠  no reject after 30 rapid updates — churn protection may be disabled in rules");
     }
