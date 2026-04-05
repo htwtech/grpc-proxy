@@ -233,13 +233,16 @@ impl ProxyHttp for SolanaGrpcProxy {
             let header = build_grpc_error_header(GRPC_STATUS_INVALID_ARGUMENT, &msg)?;
             session.write_response_header(header, true).await?;
             ctx.response_sent = true;
-            // Drop the body so upstream doesn't receive it, then return error
-            // to stop the proxy pipeline.
+            // Drop the body so upstream doesn't receive it.
             *body = None;
             session.set_keepalive(None);
-            return Err(Error::explain(
-                ErrorType::HTTPStatus(200),
+            // Return a ConnectionClosed error — Pingora will skip respond_error
+            // in fail_to_proxy (because code==0 for Downstream/ConnectionClosed)
+            // and won't try to write another response header.
+            return Err(Error::because(
+                ErrorType::ConnectionClosed,
                 "grpc subscribe rejected",
+                Error::new(ErrorType::HTTPStatus(200)),
             ));
         }
         Ok(())
@@ -270,15 +273,16 @@ impl ProxyHttp for SolanaGrpcProxy {
     where
         Self::CTX: Send + Sync,
     {
-        // If we already sent a gRPC error response, don't try to write another
+        // If we already sent a gRPC error response (from request_body_filter),
+        // do nothing — the response is already on the wire.
         if ctx.response_sent {
             return FailToProxy {
-                error_code: 200,
+                error_code: 0, // 0 = connection dead, don't try to write
                 can_reuse_downstream: false,
             };
         }
 
-        // Convert any proxy error to a gRPC internal error response
+        // For real proxy errors (upstream down, etc), send a gRPC internal error.
         let msg = format!("{}", e);
         let _ = send_grpc_error(session, crate::grpc::GRPC_STATUS_INTERNAL, &msg).await;
         FailToProxy {
