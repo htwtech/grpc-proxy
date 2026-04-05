@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 pub struct Config {
     /// Address to listen on (e.g. "0.0.0.0:10000")
     pub listen: String,

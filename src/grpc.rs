@@ -14,6 +14,7 @@ use pingora::proxy::Session;
 use pingora::Result;
 
 // gRPC status codes (https://grpc.io/docs/guides/status-codes/)
+#[allow(dead_code)]
 pub const GRPC_STATUS_OK: u8 = 0;
 pub const GRPC_STATUS_INVALID_ARGUMENT: u8 = 3;
 pub const GRPC_STATUS_PERMISSION_DENIED: u8 = 7;
