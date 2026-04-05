@@ -5,8 +5,31 @@ edition = "2021"
 description = "Minimal Pingora-based gRPC proxy for Solana Yellowstone/Geyser with per-IP SubscribeRequest filtering"
 license = "Apache-2.0"
 
-# Make this a standalone package, not part of any parent workspace
+# Standalone package with vendored (forked) pingora in ./pingora-vendor
 [workspace]
+exclude = ["pingora-vendor"]
+
+# Use local forked pingora — adds pre_upstream_body_filter hook for
+# validating request body before upstream connection is used.
+[patch.crates-io]
+pingora = { path = "pingora-vendor/pingora" }
+pingora-core = { path = "pingora-vendor/pingora-core" }
+pingora-proxy = { path = "pingora-vendor/pingora-proxy" }
+pingora-error = { path = "pingora-vendor/pingora-error" }
+pingora-http = { path = "pingora-vendor/pingora-http" }
+pingora-limits = { path = "pingora-vendor/pingora-limits" }
+pingora-timeout = { path = "pingora-vendor/pingora-timeout" }
+pingora-cache = { path = "pingora-vendor/pingora-cache" }
+pingora-lru = { path = "pingora-vendor/pingora-lru" }
+pingora-pool = { path = "pingora-vendor/pingora-pool" }
+pingora-runtime = { path = "pingora-vendor/pingora-runtime" }
+pingora-header-serde = { path = "pingora-vendor/pingora-header-serde" }
+pingora-load-balancing = { path = "pingora-vendor/pingora-load-balancing" }
+pingora-ketama = { path = "pingora-vendor/pingora-ketama" }
+pingora-openssl = { path = "pingora-vendor/pingora-openssl" }
+pingora-boringssl = { path = "pingora-vendor/pingora-boringssl" }
+pingora-rustls = { path = "pingora-vendor/pingora-rustls" }
+pingora-memory-cache = { path = "pingora-vendor/pingora-memory-cache" }
 
 [dependencies]
 pingora = { version = "0.8.0", features = ["lb", "openssl"] }

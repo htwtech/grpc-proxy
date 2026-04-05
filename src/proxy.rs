@@ -2,8 +2,8 @@
 
 use crate::config::Config;
 use crate::grpc::{
-    build_grpc_error_header, send_grpc_error, GRPC_STATUS_INVALID_ARGUMENT,
-    GRPC_STATUS_PERMISSION_DENIED, GRPC_STATUS_RESOURCE_EXHAUSTED,
+    send_grpc_error, GRPC_STATUS_INVALID_ARGUMENT, GRPC_STATUS_PERMISSION_DENIED,
+    GRPC_STATUS_RESOURCE_EXHAUSTED,
 };
 use crate::protobuf::MAX_BODY_SIZE;
 use crate::rules::{load_rules_from_dir, FilterRules};
@@ -30,6 +30,8 @@ pub struct RequestCtx {
     pub guard: Option<Guard>,
     /// True if we already wrote a response and the request should terminate
     pub response_sent: bool,
+    /// Body chunk read in pre_upstream_body_filter, re-injected in request_body_filter
+    pub buffered_body: Option<Bytes>,
 }
 
 impl Default for RequestCtx {
@@ -39,6 +41,7 @@ impl Default for RequestCtx {
             rules: None,
             guard: None,
             response_sent: false,
+            buffered_body: None,
         }
     }
 }
@@ -202,9 +205,65 @@ impl ProxyHttp for SolanaGrpcProxy {
         Ok(false)
     }
 
-    async fn request_body_filter(
+    /// Hook added by our pingora fork: called after upstream TCP connect but
+    /// BEFORE request headers are forwarded upstream. We read the first body
+    /// chunk here to validate before any upstream bytes are sent.
+    async fn pre_upstream_body_filter(
         &self,
         session: &mut Session,
+        ctx: &mut Self::CTX,
+    ) -> Result<bool>
+    where
+        Self::CTX: Send + Sync,
+    {
+        let Some(rules) = ctx.rules.clone() else {
+            return Ok(false);
+        };
+
+        // Read the first body chunk (initial SubscribeRequest protobuf)
+        let first_chunk: Option<Bytes> = session
+            .downstream_session
+            .read_request_body()
+            .await?;
+        let Some(chunk) = first_chunk else {
+            return Ok(false);
+        };
+
+        if chunk.len() > MAX_BODY_SIZE {
+            tracing::warn!(client_ip = %ctx.client_ip, "request body too large");
+            send_grpc_error(
+                session,
+                GRPC_STATUS_RESOURCE_EXHAUSTED,
+                "request body too large",
+            )
+            .await?;
+            ctx.response_sent = true;
+            return Ok(true);
+        }
+
+        // Validate the protobuf (skip 5-byte gRPC frame header)
+        if chunk.len() >= 5 {
+            let proto_buf = &chunk[5..];
+            if let Err(msg) = validate_subscribe_request(&rules, proto_buf) {
+                tracing::warn!(
+                    client_ip = %ctx.client_ip,
+                    error = %msg,
+                    "grpc subscribe filter rejected"
+                );
+                send_grpc_error(session, GRPC_STATUS_INVALID_ARGUMENT, &msg).await?;
+                ctx.response_sent = true;
+                return Ok(true);
+            }
+        }
+
+        // Buffer the chunk so request_body_filter can re-inject it upstream
+        ctx.buffered_body = Some(chunk);
+        Ok(false)
+    }
+
+    async fn request_body_filter(
+        &self,
+        _session: &mut Session,
         body: &mut Option<Bytes>,
         _end_of_stream: bool,
         ctx: &mut Self::CTX,
@@ -212,38 +271,10 @@ impl ProxyHttp for SolanaGrpcProxy {
     where
         Self::CTX: Send + Sync,
     {
-        let Some(rules) = &ctx.rules else {
-            return Ok(());
-        };
-        let Some(buf) = body else {
-            return Ok(());
-        };
-        if buf.len() < 5 || buf.len() > MAX_BODY_SIZE {
-            return Ok(());
-        }
-
-        let proto_buf = &buf[5..];
-        if let Err(msg) = validate_subscribe_request(rules, proto_buf) {
-            tracing::warn!(
-                client_ip = %ctx.client_ip,
-                error = %msg,
-                "grpc subscribe filter rejected"
-            );
-            // Send gRPC trailers-only error response directly to downstream.
-            let header = build_grpc_error_header(GRPC_STATUS_INVALID_ARGUMENT, &msg)?;
-            session.write_response_header(header, true).await?;
-            ctx.response_sent = true;
-            // Drop the body so upstream doesn't receive it.
-            *body = None;
-            session.set_keepalive(None);
-            // Return a ConnectionClosed error — Pingora will skip respond_error
-            // in fail_to_proxy (because code==0 for Downstream/ConnectionClosed)
-            // and won't try to write another response header.
-            return Err(Error::because(
-                ErrorType::ConnectionClosed,
-                "grpc subscribe rejected",
-                Error::new(ErrorType::HTTPStatus(200)),
-            ));
+        // Re-inject the body chunk read in pre_upstream_body_filter so the
+        // upstream receives the original SubscribeRequest.
+        if let Some(buffered) = ctx.buffered_body.take() {
+            *body = Some(buffered);
         }
         Ok(())
     }
