@@ -1,0 +1,39 @@
+# Example per-IP rules file.
+# Rename to <IP>.toml (e.g. 192.168.1.10.toml) and place in rules_dir.
+# Any client IP without a matching file will be rejected with
+# gRPC PERMISSION_DENIED.
+
+# Max concurrent Subscribe streams from this IP (0 = unlimited)
+max_connections = 5
+
+[accounts]
+account_max = 40
+owner_max = 20
+data_slice_max = 2
+account_reject = ["TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"]
+owner_reject = ["11111111111111111111111111111111"]
+
+[transactions]
+account_include_max = 30
+account_exclude_max = 20
+account_required_max = 40
+account_include_reject = ["TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"]
+
+[blocks]
+account_include_max = 20
+include_accounts = false
+include_entries = false
+include_transactions = true
+account_include_reject = ["TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"]
+
+[blocks_meta]
+max = 10
+
+[entry]
+max = 10
+
+[transactions_status]
+account_include_max = 20
+account_exclude_max = 20
+account_required_max = 20
+account_include_reject = ["TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"]
