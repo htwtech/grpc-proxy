@@ -349,6 +349,8 @@ impl ProxyHttp for SolanaGrpcProxy {
                 client_ip = %ctx.client_ip,
                 frame_len = len,
                 end_of_stream,
+                churn_max = rules.max_updates_per_window,
+                churn_count = ctx.churn_count,
                 "validating SubscribeRequest frame"
             );
 
