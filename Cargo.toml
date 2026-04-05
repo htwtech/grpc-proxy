@@ -5,6 +5,9 @@ edition = "2021"
 description = "Minimal Pingora-based gRPC proxy for Solana Yellowstone/Geyser with per-IP SubscribeRequest filtering"
 license = "Apache-2.0"
 
+# Make this a standalone package, not part of any parent workspace
+[workspace]
+
 [dependencies]
 pingora = { version = "0.8.0", features = ["lb", "openssl"] }
 pingora-limits = "0.8.0"
