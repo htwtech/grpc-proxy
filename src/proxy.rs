@@ -32,6 +32,10 @@ pub struct RequestCtx {
     pub response_sent: bool,
     /// Body chunk read in pre_upstream_body_filter, re-injected in request_body_filter
     pub buffered_body: Option<Bytes>,
+    /// True when we've already validated (or decided to skip validation of)
+    /// the first body chunk — prevents re-validating ping messages or
+    /// subsequent SubscribeRequest updates on the same stream.
+    pub late_validation_done: bool,
 }
 
 impl Default for RequestCtx {
@@ -42,6 +46,7 @@ impl Default for RequestCtx {
             guard: None,
             response_sent: false,
             buffered_body: None,
+            late_validation_done: false,
         }
     }
 }
@@ -282,7 +287,7 @@ impl ProxyHttp for SolanaGrpcProxy {
         &self,
         session: &mut Session,
         body: &mut Option<Bytes>,
-        _end_of_stream: bool,
+        end_of_stream: bool,
         ctx: &mut Self::CTX,
     ) -> Result<()>
     where
@@ -291,24 +296,35 @@ impl ProxyHttp for SolanaGrpcProxy {
         // Re-inject the body chunk read in pre_upstream_body_filter (happy path)
         if let Some(buffered) = ctx.buffered_body.take() {
             *body = Some(buffered);
+            ctx.late_validation_done = true; // already validated in pre_upstream
             return Ok(());
         }
 
-        // Backup validation path: for streaming clients (tonic) that don't
-        // send DATA frame before the server response, pre_upstream_body_filter
-        // times out and skips validation. Validate here when the body finally
-        // arrives. If rejected, our patched proxy_h2.rs will send RST_STREAM
-        // on the upstream client_body, and Pingora will reset the downstream
-        // via fail_to_proxy when the error propagates.
+        // Only validate once per stream — skip subsequent ping/update messages
+        if ctx.late_validation_done {
+            return Ok(());
+        }
+
         let Some(rules) = &ctx.rules else {
             return Ok(());
         };
         let Some(buf) = body else {
             return Ok(());
         };
+
+        tracing::debug!(
+            client_ip = %ctx.client_ip,
+            body_len = buf.len(),
+            end_of_stream,
+            "request_body_filter: validating first body chunk"
+        );
+
         if buf.len() < 5 || buf.len() > MAX_BODY_SIZE {
             return Ok(());
         }
+
+        // Mark as validated regardless of outcome (we only validate first chunk)
+        ctx.late_validation_done = true;
 
         let proto_buf = &buf[5..];
         if let Err(msg) = validate_subscribe_request(rules, proto_buf) {
@@ -331,6 +347,11 @@ impl ProxyHttp for SolanaGrpcProxy {
                 "grpc subscribe rejected",
                 Error::new(ErrorType::HTTPStatus(200)),
             ));
+        } else {
+            tracing::debug!(
+                client_ip = %ctx.client_ip,
+                "request_body_filter: validation passed"
+            );
         }
         Ok(())
     }
