@@ -13,6 +13,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use pingora::prelude::*;
 use pingora::protocols::l4::socket::SocketAddr;
+use pingora::proxy::FailToProxy;
 use pingora::upstreams::peer::ALPN;
 use pingora_limits::inflight::{Guard, Inflight};
 use std::collections::HashMap;
