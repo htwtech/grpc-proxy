@@ -10,6 +10,11 @@ pub struct Config {
     /// Address to listen on (e.g. "0.0.0.0:10000")
     pub listen: String,
 
+    /// Optional address for /metrics and /health endpoint
+    /// (e.g. "127.0.0.1:9090"). If unset, metrics service is disabled.
+    #[serde(default)]
+    pub metrics_listen: Option<String>,
+
     /// Upstream Yellowstone gRPC address (e.g. "127.0.0.1:11000")
     pub upstream: String,
 

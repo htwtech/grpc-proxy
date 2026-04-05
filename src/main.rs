@@ -1,5 +1,6 @@
 mod config;
 mod grpc;
+mod metrics_service;
 mod protobuf;
 mod proxy;
 mod rules;
@@ -7,8 +8,11 @@ mod validator;
 
 use clap::Parser;
 use config::Config;
+use metrics_service::MetricsApp;
+use pingora::apps::http_app::HttpServer;
 use pingora::apps::HttpServerOptions;
 use pingora::prelude::*;
+use pingora::services::listening::Service;
 use proxy::SolanaGrpcProxy;
 
 #[derive(Parser, Debug)]
@@ -70,5 +74,15 @@ fn main() {
     service.add_tcp(&listen_addr);
 
     server.add_service(service);
+
+    // Optional metrics/health endpoint
+    if let Some(metrics_addr) = config.metrics_listen.clone() {
+        let metrics_app = HttpServer::new_app(MetricsApp);
+        let mut metrics_service = Service::new("metrics".to_string(), metrics_app);
+        metrics_service.add_tcp(&metrics_addr);
+        server.add_service(metrics_service);
+        tracing::info!(addr = %metrics_addr, "metrics endpoint enabled at /metrics and /health");
+    }
+
     server.run_forever();
 }
