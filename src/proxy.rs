@@ -211,75 +211,25 @@ impl ProxyHttp for SolanaGrpcProxy {
     }
 
     /// Hook added by our pingora fork: called after upstream TCP connect but
-    /// BEFORE request headers are forwarded upstream. We read the first body
-    /// chunk here to validate before any upstream bytes are sent.
+    /// BEFORE request headers are forwarded upstream.
+    ///
+    /// We used to read the body here (for grpcurl-style clients that send
+    /// DATA immediately), but calling `read_request_body()` with a timeout
+    /// appears to put h2::RecvStream into a state where subsequent reads
+    /// in the main proxy loop don't fire, breaking streaming clients.
+    ///
+    /// Now this hook is a no-op stub. All validation happens in
+    /// `request_body_filter` when the client actually sends DATA frames —
+    /// which works for both grpcurl (sends immediately) and tonic (sends
+    /// after receiving server response headers).
     async fn pre_upstream_body_filter(
         &self,
-        session: &mut Session,
-        ctx: &mut Self::CTX,
+        _session: &mut Session,
+        _ctx: &mut Self::CTX,
     ) -> Result<bool>
     where
         Self::CTX: Send + Sync,
     {
-        let Some(rules) = ctx.rules.clone() else {
-            return Ok(false);
-        };
-
-        // Read the first body chunk (initial SubscribeRequest protobuf) with
-        // a short timeout. Some gRPC clients don't send a DATA frame until
-        // they receive the initial server response, so we can't block forever.
-        // If no body arrives within the timeout, allow the request to proceed
-        // and fall through to regular request_body_filter (which won't
-        // validate — this is a best-effort guard).
-        let read_fut = session.downstream_session.read_request_body();
-        let first_chunk = match tokio::time::timeout(
-            std::time::Duration::from_millis(500),
-            read_fut,
-        )
-        .await
-        {
-            Ok(Ok(chunk)) => chunk,
-            Ok(Err(e)) => return Err(e),
-            Err(_) => {
-                // Timeout — client isn't sending body before server response.
-                // Allow upstream to proceed without validation.
-                tracing::debug!(client_ip = %ctx.client_ip, "body not available before upstream, skipping validation");
-                return Ok(false);
-            }
-        };
-        let Some(chunk) = first_chunk else {
-            return Ok(false);
-        };
-
-        if chunk.len() > MAX_BODY_SIZE {
-            tracing::warn!(client_ip = %ctx.client_ip, "request body too large");
-            send_grpc_error(
-                session,
-                GRPC_STATUS_RESOURCE_EXHAUSTED,
-                "request body too large",
-            )
-            .await?;
-            ctx.response_sent = true;
-            return Ok(true);
-        }
-
-        // Validate the protobuf (skip 5-byte gRPC frame header)
-        if chunk.len() >= 5 {
-            let proto_buf = &chunk[5..];
-            if let Err(msg) = validate_subscribe_request(&rules, proto_buf) {
-                tracing::warn!(
-                    client_ip = %ctx.client_ip,
-                    error = %msg,
-                    "grpc subscribe filter rejected"
-                );
-                send_grpc_error(session, GRPC_STATUS_INVALID_ARGUMENT, &msg).await?;
-                ctx.response_sent = true;
-                return Ok(true);
-            }
-        }
-
-        // Buffer the chunk so request_body_filter can re-inject it upstream
-        ctx.buffered_body = Some(chunk);
         Ok(false)
     }
 
@@ -293,14 +243,7 @@ impl ProxyHttp for SolanaGrpcProxy {
     where
         Self::CTX: Send + Sync,
     {
-        // Re-inject the body chunk read in pre_upstream_body_filter (happy path)
-        if let Some(buffered) = ctx.buffered_body.take() {
-            *body = Some(buffered);
-            ctx.late_validation_done = true; // already validated in pre_upstream
-            return Ok(());
-        }
-
-        // Only validate once per stream — skip subsequent ping/update messages
+        // Validate only the first body chunk — skip pings and updates
         if ctx.late_validation_done {
             return Ok(());
         }
@@ -316,14 +259,14 @@ impl ProxyHttp for SolanaGrpcProxy {
             client_ip = %ctx.client_ip,
             body_len = buf.len(),
             end_of_stream,
-            "request_body_filter: validating first body chunk"
+            "request_body_filter: first body chunk received"
         );
 
         if buf.len() < 5 || buf.len() > MAX_BODY_SIZE {
             return Ok(());
         }
 
-        // Mark as validated regardless of outcome (we only validate first chunk)
+        // Mark as validated regardless of outcome
         ctx.late_validation_done = true;
 
         let proto_buf = &buf[5..];
@@ -331,12 +274,11 @@ impl ProxyHttp for SolanaGrpcProxy {
             tracing::warn!(
                 client_ip = %ctx.client_ip,
                 error = %msg,
-                "grpc subscribe filter rejected (late path)"
+                "grpc subscribe filter rejected"
             );
-            // Try to send a gRPC error response header before we abort.
-            // This may fail if upstream response headers were already
-            // forwarded — in that case RST_STREAM from our patched
-            // proxy_h2.rs is the fallback.
+            // Try to send gRPC error response header. May fail if upstream
+            // response was already forwarded — in that case the RST_STREAM
+            // from our patched proxy_h2.rs ensures the client disconnects.
             let header = build_grpc_error_header(GRPC_STATUS_INVALID_ARGUMENT, &msg)?;
             let _ = session.write_response_header(header, true).await;
             ctx.response_sent = true;
@@ -347,12 +289,12 @@ impl ProxyHttp for SolanaGrpcProxy {
                 "grpc subscribe rejected",
                 Error::new(ErrorType::HTTPStatus(200)),
             ));
-        } else {
-            tracing::debug!(
-                client_ip = %ctx.client_ip,
-                "request_body_filter: validation passed"
-            );
         }
+
+        tracing::debug!(
+            client_ip = %ctx.client_ip,
+            "request_body_filter: validation passed"
+        );
         Ok(())
     }
 
