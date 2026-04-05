@@ -2,8 +2,8 @@
 
 use crate::config::Config;
 use crate::grpc::{
-    send_grpc_error, GRPC_STATUS_INVALID_ARGUMENT, GRPC_STATUS_PERMISSION_DENIED,
-    GRPC_STATUS_RESOURCE_EXHAUSTED,
+    build_grpc_error_header, send_grpc_error, GRPC_STATUS_INVALID_ARGUMENT,
+    GRPC_STATUS_PERMISSION_DENIED, GRPC_STATUS_RESOURCE_EXHAUSTED,
 };
 use crate::protobuf::MAX_BODY_SIZE;
 use crate::rules::{load_rules_from_dir, FilterRules};
@@ -280,7 +280,7 @@ impl ProxyHttp for SolanaGrpcProxy {
 
     async fn request_body_filter(
         &self,
-        _session: &mut Session,
+        session: &mut Session,
         body: &mut Option<Bytes>,
         _end_of_stream: bool,
         ctx: &mut Self::CTX,
@@ -288,10 +288,49 @@ impl ProxyHttp for SolanaGrpcProxy {
     where
         Self::CTX: Send + Sync,
     {
-        // Re-inject the body chunk read in pre_upstream_body_filter so the
-        // upstream receives the original SubscribeRequest.
+        // Re-inject the body chunk read in pre_upstream_body_filter (happy path)
         if let Some(buffered) = ctx.buffered_body.take() {
             *body = Some(buffered);
+            return Ok(());
+        }
+
+        // Backup validation path: for streaming clients (tonic) that don't
+        // send DATA frame before the server response, pre_upstream_body_filter
+        // times out and skips validation. Validate here when the body finally
+        // arrives. If rejected, our patched proxy_h2.rs will send RST_STREAM
+        // on the upstream client_body, and Pingora will reset the downstream
+        // via fail_to_proxy when the error propagates.
+        let Some(rules) = &ctx.rules else {
+            return Ok(());
+        };
+        let Some(buf) = body else {
+            return Ok(());
+        };
+        if buf.len() < 5 || buf.len() > MAX_BODY_SIZE {
+            return Ok(());
+        }
+
+        let proto_buf = &buf[5..];
+        if let Err(msg) = validate_subscribe_request(rules, proto_buf) {
+            tracing::warn!(
+                client_ip = %ctx.client_ip,
+                error = %msg,
+                "grpc subscribe filter rejected (late path)"
+            );
+            // Try to send a gRPC error response header before we abort.
+            // This may fail if upstream response headers were already
+            // forwarded — in that case RST_STREAM from our patched
+            // proxy_h2.rs is the fallback.
+            let header = build_grpc_error_header(GRPC_STATUS_INVALID_ARGUMENT, &msg)?;
+            let _ = session.write_response_header(header, true).await;
+            ctx.response_sent = true;
+            *body = None;
+            session.set_keepalive(None);
+            return Err(Error::because(
+                ErrorType::ConnectionClosed,
+                "grpc subscribe rejected",
+                Error::new(ErrorType::HTTPStatus(200)),
+            ));
         }
         Ok(())
     }

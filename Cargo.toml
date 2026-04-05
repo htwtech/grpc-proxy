@@ -51,3 +51,5 @@ strip = true
 inherits = "release"
 debug = 1
 strip = "none"
+opt-level = 3
+

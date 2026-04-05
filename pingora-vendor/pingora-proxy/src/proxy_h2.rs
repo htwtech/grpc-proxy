@@ -749,9 +749,17 @@ where
             .request_body_filter(&mut data, end_of_body)
             .await?;
 
-        self.inner
+        // Call user's request_body_filter. On error, send RST_STREAM to the
+        // upstream H2 client so the upstream stops streaming immediately.
+        // The downstream is reset by the proxy loop when this error propagates.
+        if let Err(e) = self
+            .inner
             .request_body_filter(session, &mut data, end_of_body, ctx)
-            .await?;
+            .await
+        {
+            client_body.send_reset(h2::Reason::CANCEL);
+            return Err(e);
+        }
 
         /* it is normal to get 0 bytes because of multi-chunk parsing or request_body_filter.
          * Although there is no harm writing empty byte to h2, unlike h1, we ignore it
