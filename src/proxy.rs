@@ -31,10 +31,11 @@ pub struct RequestCtx {
     pub guard: Option<Guard>,
     /// True if we already wrote a response and the request should terminate
     pub response_sent: bool,
-    /// True when we've already validated (or decided to skip validation of)
-    /// the first body chunk — prevents re-validating ping messages or
-    /// subsequent SubscribeRequest updates on the same stream.
-    pub late_validation_done: bool,
+    /// Buffer for partial gRPC frames that span multiple DATA frames.
+    /// We accumulate bytes until we have a complete gRPC message, then
+    /// validate it. Every SubscribeRequest in the stream is validated —
+    /// no early-exit.
+    pub pending_frame: bytes::BytesMut,
 }
 
 impl Default for RequestCtx {
@@ -44,7 +45,7 @@ impl Default for RequestCtx {
             rules: None,
             guard: None,
             response_sent: false,
-            late_validation_done: false,
+            pending_frame: bytes::BytesMut::new(),
         }
     }
 }
@@ -114,6 +115,28 @@ fn now_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+/// Send a gRPC error response and return an error that aborts the request.
+/// Used from within request_body_filter. The RST_STREAM to upstream is
+/// emitted by our patched proxy_h2.rs when it sees the returned Err.
+async fn reject_body(
+    session: &mut Session,
+    ctx: &mut RequestCtx,
+    body: &mut Option<Bytes>,
+    grpc_status: u8,
+    msg: &str,
+) -> Result<()> {
+    let header = build_grpc_error_header(grpc_status, msg)?;
+    let _ = session.write_response_header(header, true).await;
+    ctx.response_sent = true;
+    *body = None;
+    session.set_keepalive(None);
+    Err(Error::because(
+        ErrorType::ConnectionClosed,
+        "grpc subscribe rejected",
+        Error::new(ErrorType::HTTPStatus(200)),
+    ))
 }
 
 /// Extract client IP from X-Forwarded-For, X-Real-IP, or socket address.
@@ -241,58 +264,107 @@ impl ProxyHttp for SolanaGrpcProxy {
     where
         Self::CTX: Send + Sync,
     {
-        // Validate only the first body chunk — skip pings and updates
-        if ctx.late_validation_done {
+        let Some(rules) = ctx.rules.clone() else {
+            return Ok(());
+        };
+        let Some(buf) = body.as_ref() else {
+            return Ok(());
+        };
+        if buf.is_empty() {
             return Ok(());
         }
 
-        let Some(rules) = &ctx.rules else {
-            return Ok(());
-        };
-        let Some(buf) = body else {
-            return Ok(());
-        };
+        // Append the incoming chunk to the pending frame buffer. This handles
+        // the case where a single SubscribeRequest is split across multiple
+        // DATA frames, or multiple small SubscribeRequests arrive in one frame.
+        ctx.pending_frame.extend_from_slice(buf);
 
-        tracing::debug!(
-            client_ip = %ctx.client_ip,
-            body_len = buf.len(),
-            end_of_stream,
-            "request_body_filter: first body chunk received"
-        );
-
-        if buf.len() < 5 || buf.len() > MAX_BODY_SIZE {
-            return Ok(());
-        }
-
-        // Mark as validated regardless of outcome
-        ctx.late_validation_done = true;
-
-        let proto_buf = &buf[5..];
-        if let Err(msg) = validate_subscribe_request(rules, proto_buf) {
+        // Enforce a hard upper bound on buffered data to prevent memory abuse.
+        if ctx.pending_frame.len() > MAX_BODY_SIZE * 4 {
             tracing::warn!(
                 client_ip = %ctx.client_ip,
-                error = %msg,
-                "grpc subscribe filter rejected"
+                size = ctx.pending_frame.len(),
+                "pending frame buffer exceeded limit"
             );
-            // Try to send gRPC error response header. May fail if upstream
-            // response was already forwarded — in that case the RST_STREAM
-            // from our patched proxy_h2.rs ensures the client disconnects.
-            let header = build_grpc_error_header(GRPC_STATUS_INVALID_ARGUMENT, &msg)?;
-            let _ = session.write_response_header(header, true).await;
-            ctx.response_sent = true;
-            *body = None;
-            session.set_keepalive(None);
-            return Err(Error::because(
-                ErrorType::ConnectionClosed,
-                "grpc subscribe rejected",
-                Error::new(ErrorType::HTTPStatus(200)),
-            ));
+            return reject_body(
+                session,
+                ctx,
+                body,
+                GRPC_STATUS_RESOURCE_EXHAUSTED,
+                "grpc frame too large",
+            )
+            .await;
         }
 
-        tracing::debug!(
-            client_ip = %ctx.client_ip,
-            "request_body_filter: validation passed"
-        );
+        // Parse and validate every complete gRPC frame in the buffer.
+        // gRPC frame format: [1 byte compressed][4 bytes length BE][N bytes protobuf]
+        loop {
+            if ctx.pending_frame.len() < 5 {
+                break; // Incomplete header
+            }
+            let len = u32::from_be_bytes([
+                ctx.pending_frame[1],
+                ctx.pending_frame[2],
+                ctx.pending_frame[3],
+                ctx.pending_frame[4],
+            ]) as usize;
+            let total_frame_size = 5 + len;
+            if ctx.pending_frame.len() < total_frame_size {
+                break; // Incomplete body
+            }
+            if len > MAX_BODY_SIZE {
+                return reject_body(
+                    session,
+                    ctx,
+                    body,
+                    GRPC_STATUS_RESOURCE_EXHAUSTED,
+                    "grpc message too large",
+                )
+                .await;
+            }
+
+            let compressed = ctx.pending_frame[0];
+            let proto_buf = ctx.pending_frame[5..total_frame_size].to_vec();
+
+            // Reject compressed frames — we can't parse them
+            if compressed != 0 {
+                return reject_body(
+                    session,
+                    ctx,
+                    body,
+                    GRPC_STATUS_INVALID_ARGUMENT,
+                    "compressed gRPC frames not supported",
+                )
+                .await;
+            }
+
+            tracing::debug!(
+                client_ip = %ctx.client_ip,
+                frame_len = len,
+                end_of_stream,
+                "validating SubscribeRequest frame"
+            );
+
+            if let Err(msg) = validate_subscribe_request(&rules, &proto_buf) {
+                tracing::warn!(
+                    client_ip = %ctx.client_ip,
+                    error = %msg,
+                    "grpc subscribe filter rejected"
+                );
+                return reject_body(
+                    session,
+                    ctx,
+                    body,
+                    GRPC_STATUS_INVALID_ARGUMENT,
+                    &msg,
+                )
+                .await;
+            }
+
+            // Consume the validated frame from the buffer
+            let _ = ctx.pending_frame.split_to(total_frame_size);
+        }
+
         Ok(())
     }
 
