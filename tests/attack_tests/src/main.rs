@@ -153,26 +153,41 @@ async fn test_3_delayed_subscribe(args: &Args) -> Result<()> {
     println!("  -> sending rejected SubscribeRequest");
     tx.send(make_request(vec![args.rejected.clone()])).await?;
 
-    match tokio::time::timeout(Duration::from_secs(5), stream.next()).await {
-        Ok(Some(Ok(msg))) => {
-            if msg.update_oneof.is_some() && !matches!(
-                msg.update_oneof,
-                Some(yellowstone_grpc_proto::geyser::subscribe_update::UpdateOneof::Ping(_))
-            ) {
-                println!("  ❌ FAIL: received data after delayed rejected");
-            } else {
-                println!("  ℹ  got ping, continuing to wait for reject");
+    // Loop through messages until we get a reject or a transaction.
+    // Pings are expected and ignored.
+    let start = std::time::Instant::now();
+    let mut got_reject = false;
+    let mut got_tx = false;
+    while start.elapsed() < Duration::from_secs(10) {
+        match tokio::time::timeout(Duration::from_secs(2), stream.next()).await {
+            Ok(Some(Ok(msg))) => {
+                use yellowstone_grpc_proto::geyser::subscribe_update::UpdateOneof;
+                match msg.update_oneof {
+                    Some(UpdateOneof::Ping(_)) | Some(UpdateOneof::Pong(_)) => continue,
+                    Some(UpdateOneof::Transaction(_)) => {
+                        got_tx = true;
+                        break;
+                    }
+                    _ => continue,
+                }
             }
+            Ok(Some(Err(status))) => {
+                println!("  ✅ PASS: code={:?} msg={}", status.code(), status.message());
+                got_reject = true;
+                break;
+            }
+            Ok(None) => {
+                println!("  ✅ PASS: stream closed");
+                got_reject = true;
+                break;
+            }
+            Err(_) => continue,
         }
-        Ok(Some(Err(status))) => {
-            println!("  ✅ PASS: code={:?} msg={}", status.code(), status.message());
-        }
-        Ok(None) => {
-            println!("  ✅ PASS: stream closed");
-        }
-        Err(_) => {
-            println!("  ❌ FAIL: timeout — delayed rejected was not blocked");
-        }
+    }
+    if got_tx {
+        println!("  ❌ FAIL: received transaction after delayed rejected");
+    } else if !got_reject {
+        println!("  ❌ FAIL: timeout — delayed rejected was not blocked");
     }
     Ok(())
 }
