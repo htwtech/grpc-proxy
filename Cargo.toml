@@ -27,9 +27,6 @@ pingora-header-serde = { path = "pingora-vendor/pingora-header-serde" }
 pingora-load-balancing = { path = "pingora-vendor/pingora-load-balancing" }
 pingora-ketama = { path = "pingora-vendor/pingora-ketama" }
 pingora-openssl = { path = "pingora-vendor/pingora-openssl" }
-pingora-boringssl = { path = "pingora-vendor/pingora-boringssl" }
-pingora-rustls = { path = "pingora-vendor/pingora-rustls" }
-pingora-memory-cache = { path = "pingora-vendor/pingora-memory-cache" }
 
 [dependencies]
 pingora = { version = "0.8.0", features = ["lb", "openssl"] }
