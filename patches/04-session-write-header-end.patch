@@ -1,0 +1,79 @@
+--- a/pingora-proxy/src/lib.rs	2026-04-06 12:24:37.781085000 +0200
++++ b/pingora-proxy/src/lib.rs	2026-04-05 22:19:09.922066600 +0200
+@@ -417,7 +417,10 @@
+ 
+         if reuse {
+             // TODO: log error
+-            let persistent_settings = HttpPersistentSettings::for_session(&session);
++            let mut persistent_settings = HttpPersistentSettings::for_session(&session);
++            if let Some(uc) = self.inner.persist_connection_context(&session, ctx) {
++                persistent_settings.set_user_context(uc);
++            }
+             session
+                 .downstream_session
+                 .finish()
+@@ -549,7 +552,9 @@
+         self.downstream_modules_ctx
+             .response_header_filter(&mut resp, end_of_stream)
+             .await?;
+-        self.downstream_session.write_response_header(resp).await
++        self.downstream_session
++            .write_response_header_with_end(resp, end_of_stream)
++            .await
+     }
+ 
+     /// Similar to `write_response_header()`, this fn will clone the `resp` internally
+@@ -785,7 +790,10 @@
+                     // TODO: log error
+                     self.inner.logging(&mut session, None, &mut ctx).await;
+                     self.cleanup_sub_req(&mut session);
+-                    let persistent_settings = HttpPersistentSettings::for_session(&session);
++                    let mut persistent_settings = HttpPersistentSettings::for_session(&session);
++                    if let Some(uc) = self.inner.persist_connection_context(&session, &ctx) {
++                        persistent_settings.set_user_context(uc);
++                    }
+                     return session
+                         .downstream_session
+                         .finish()
+@@ -971,7 +979,10 @@
+         session.downstream_session.on_proxy_failure(e);
+ 
+         if res.can_reuse_downstream {
+-            let persistent_settings = HttpPersistentSettings::for_session(&session);
++            let mut persistent_settings = HttpPersistentSettings::for_session(&session);
++            if let Some(uc) = self.inner.persist_connection_context(&session, ctx) {
++                persistent_settings.set_user_context(uc);
++            }
+             session
+                 .downstream_session
+                 .finish()
+@@ -1135,9 +1146,12 @@
+ {
+     async fn process_new_http(
+         self: &Arc<Self>,
+-        session: HttpSession,
++        mut session: HttpSession,
+         shutdown: &ShutdownWatch,
+     ) -> Option<ReusedHttpStream> {
++        // Extract user context from the previous request before the session is moved into the Box
++        let prev_user_ctx = session.take_connection_user_context();
++
+         let session = Box::new(session);
+ 
+         // TODO: keepalive pool, use stack
+@@ -1155,7 +1169,14 @@
+             session.set_keepalive(None);
+         }
+ 
+-        let ctx = self.inner.new_ctx();
++        let mut ctx = self.inner.new_ctx();
++
++        // Deliver user context from the previous request on this reused connection
++        if let Some(prev_ctx) = prev_user_ctx {
++            self.inner
++                .on_connection_reuse(&mut session, &mut ctx, prev_ctx);
++        }
++
+         self.process_request(session, ctx).await
+     }
+ 

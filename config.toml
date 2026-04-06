@@ -1,0 +1,21 @@
+# solana-grpc-proxy configuration
+
+listen = "0.0.0.0:10000"
+upstream = "127.0.0.1:11000"
+rules_dir = "./rules"
+reload_interval = "30s"
+log_level = "info"
+
+# Optional Prometheus /metrics + /health endpoint.
+# Exposes build info only (proxy_info{version,build}) — no counters,
+# zero overhead on the proxy hot path.
+metrics_listen = "127.0.0.1:9090"
+
+# Upstream settings
+upstream_idle_timeout = "30m"
+upstream_connection_timeout = "5s"
+
+# TCP keepalive (optional)
+# tcp_keepalive_idle = "30s"
+# tcp_keepalive_interval = "10s"
+# tcp_keepalive_count = 3

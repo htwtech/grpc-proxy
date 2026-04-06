@@ -1,0 +1,92 @@
+--- a/pingora-core/src/protocols/http/server.rs	2026-04-06 12:24:37.776079400 +0200
++++ b/pingora-core/src/protocols/http/server.rs	2026-04-05 22:18:55.928884200 +0200
+@@ -27,6 +27,7 @@
+ use http::{header::AsHeaderName, HeaderMap};
+ use pingora_error::{Error, Result};
+ use pingora_http::{RequestHeader, ResponseHeader};
++use std::any::Any;
+ use std::time::Duration;
+ 
+ /// HTTP server session object for both HTTP/1.x and HTTP/2
+@@ -159,17 +160,29 @@
+     /// Informational headers (status code 100-199, excluding 101) can be written multiple times the final
+     /// response header (status code 200+ or 101) is written.
+     pub async fn write_response_header(&mut self, resp: Box<ResponseHeader>) -> Result<()> {
++        self.write_response_header_with_end(resp, false).await
++    }
++
++    /// Write the response header with an explicit end_of_stream flag.
++    /// For HTTP/2, if `end_of_stream=true`, this sends a HEADERS frame with
++    /// the END_STREAM flag, producing a trailers-only response (used for
++    /// gRPC errors).
++    pub async fn write_response_header_with_end(
++        &mut self,
++        resp: Box<ResponseHeader>,
++        end_of_stream: bool,
++    ) -> Result<()> {
+         match self {
+             Self::H1(s) => {
+                 s.write_response_header(resp).await?;
+                 Ok(())
+             }
+-            Self::H2(s) => s.write_response_header(resp, false),
++            Self::H2(s) => s.write_response_header(resp, end_of_stream),
+             Self::Subrequest(s) => {
+                 s.write_response_header(resp).await?;
+                 Ok(())
+             }
+-            Self::Custom(s) => s.write_response_header(resp, false).await,
++            Self::Custom(s) => s.write_response_header(resp, end_of_stream).await,
+         }
+     }
+ 
+@@ -317,6 +330,26 @@
+         }
+     }
+ 
++    /// Set user-defined context to carry across requests on the same keepalive connection.
++    ///
++    /// Only applicable for HTTP/1.x connections; noop for h2, subrequest, and custom sessions.
++    pub fn set_connection_user_context(&mut self, ctx: Option<Box<dyn Any + Send + Sync>>) {
++        if let Self::H1(s) = self {
++            s.set_connection_user_context(ctx);
++        }
++    }
++
++    /// Take the user-defined context from the previous request on this keepalive connection.
++    ///
++    /// Returns `None` for h2, subrequest, and custom sessions, or if no context was persisted.
++    pub fn take_connection_user_context(&mut self) -> Option<Box<dyn Any + Send + Sync>> {
++        if let Self::H1(s) = self {
++            s.take_connection_user_context()
++        } else {
++            None
++        }
++    }
++
+     /// Sets the downstream read timeout. This will trigger if we're unable
+     /// to read from the stream after `timeout`.
+     ///
+@@ -436,6 +469,22 @@
+         }
+     }
+ 
++    /// Controls behaviour when the client closes the connection after the request body.
++    ///
++    /// When **enabled** (default), a client close is returned as a `ConnectionClosed`
++    /// error so the proxy aborts immediately. When **disabled**, `read_body_or_idle`
++    /// stays pending so the proxy can finish delivering the upstream response.
++    ///
++    /// Only meaningful for H1 (TCP). Noop for H2/subrequest/custom.
++    pub fn set_abort_on_close(&mut self, abort: bool) {
++        match self {
++            Self::H1(s) => s.set_abort_on_close(abort),
++            Self::H2(_) => {}
++            Self::Subrequest(_) => {}
++            Self::Custom(_) => {}
++        }
++    }
++
+     /// Return a digest of the request including the method, path and Host header
+     // TODO: make this use a `Formatter`
+     pub fn request_summary(&self) -> String {

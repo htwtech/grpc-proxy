@@ -1,0 +1,145 @@
+--- a/pingora-proxy/src/proxy_h2.rs	2026-04-06 12:24:37.782082900 +0200
++++ b/pingora-proxy/src/proxy_h2.rs	2026-04-05 22:51:33.329775100 +0200
+@@ -121,6 +121,21 @@
+             }
+         }
+ 
++        // Allow user code to inspect/validate the downstream request body
++        // BEFORE any bytes are sent to the upstream. If the hook returns
++        // Ok(true), the user has already written a response downstream and
++        // we must abort without sending anything upstream.
++        match self.inner.pre_upstream_body_filter(session, ctx).await {
++            Ok(true) => {
++                // Response already sent by user code; abort upstream cleanly.
++                return (false, None);
++            }
++            Ok(false) => { /* continue */ }
++            Err(e) => {
++                return (false, Some(e));
++            }
++        }
++
+         // Remove H1 `Host` header, save it in order to add to :authority
+         // We do this because certain H2 servers expect request not to have a host header.
+         // The `Host` is removed after the upstream filters above for 2 reasons
+@@ -218,6 +233,9 @@
+                 // TODO: implement for write timeouts?
+                 if e.esource == ErrorSource::Upstream && matches!(e.etype, ReadTimedout) {
+                     client_body.send_reset(h2::Reason::CANCEL);
++                    // Mark the underlying H2 connection for shutdown so it's not used
++                    // for new streams in case it is hung.
++                    client_session.conn.mark_shutdown();
+                 }
+                 (false, Some(e))
+             }
+@@ -413,6 +431,12 @@
+                                 // skip downstream filtering entirely as the 304 will not be sent
+                                 break;
+                             }
++                            #[cfg(feature = "adjust_upstream_modules")]
++                            if let HttpTask::Header(header, end_of_stream) = &t {
++                                self.inner
++                                    .adjust_upstream_modules(session, header, *end_of_stream, ctx)
++                                    .await?;
++                            }
+                             session.upstream_compression.response_filter(&mut t);
+                             // check error and abort
+                             // otherwise the error is surfaced via write_response_tasks()
+@@ -725,9 +749,17 @@
+             .request_body_filter(&mut data, end_of_body)
+             .await?;
+ 
+-        self.inner
++        // Call user's request_body_filter. On error, send RST_STREAM to the
++        // upstream H2 client so the upstream stops streaming immediately.
++        // The downstream is reset by the proxy loop when this error propagates.
++        if let Err(e) = self
++            .inner
+             .request_body_filter(session, &mut data, end_of_body, ctx)
+-            .await?;
++            .await
++        {
++            client_body.send_reset(h2::Reason::CANCEL);
++            return Err(e);
++        }
+ 
+         /* it is normal to get 0 bytes because of multi-chunk parsing or request_body_filter.
+          * Although there is no harm writing empty byte to h2, unlike h1, we ignore it
+@@ -806,12 +838,25 @@
+         }
+     }
+ 
+-    while let Some(chunk) = client
+-        .read_response_body()
+-        .await
+-        .map_err(|e| e.into_up())
+-        .transpose()
+-    {
++    // Read body from H2 upstream, racing each read against tx.closed().
++    //
++    // When proxying an H2 upstream response with Content-Length to an H1 downstream,
++    // bidirection_down_to_up() may determine the response is complete (all Content-Length
++    // bytes written) and exit before the H2 stream signals END_STREAM. This drops the
++    // receiving end (rx) of the channel. Without this race, read_response_body() would
++    // block until the H2 stream eventually ends (e.g. via trailers or read_timeout),
++    // while the downstream side (which could be H1) is in theory already done.
++    loop {
++        let chunk = tokio::select! {
++            biased;
++            body = client.read_response_body() => {
++                body.map_err(|e| e.into_up()).transpose()
++            }
++            _ = tx.closed() => None,
++        };
++        let Some(chunk) = chunk else {
++            break;
++        };
+         let data = match chunk {
+             Ok(d) => d,
+             Err(e) => {
+@@ -834,10 +879,10 @@
+                     .send(HttpTask::Body(Some(data), eos))
+                     .await
+                     .or_err(InternalError, "sending h2 body to pipe");
+-                // If the if the response with content-length is sent to an HTTP1 downstream,
++                // If the response with content-length is sent to an HTTP1 downstream,
+                 // bidirection_down_to_up() could decide that the body has finished and exit without
+                 // waiting for this function to signal the eos. In this case tx being closed is not
+-                // an sign of error. It should happen if the only thing left for the h2 to send is
++                // a sign of error. It should happen if the only thing left for the h2 to send is
+                 // an empty data frame with eos set.
+                 if sent.is_err() && eos && empty {
+                     return Ok(());
+@@ -852,12 +897,26 @@
+         }
+     }
+ 
+-    // attempt to get trailers
+-    let trailers = match client.read_trailers().await {
+-        Ok(t) => t,
+-        Err(e) => {
+-            // Similar to above, push the error to downstream and then quit
+-            let _ = tx.send(HttpTask::Failed(e.into_up())).await;
++    // If the channel is already closed, downstream is finished
++    // TODO: note that this does skip trailers/done, but downstream
++    // has already finished so no more is in theory necessary to send
++    if tx.is_closed() {
++        return Ok(());
++    }
++
++    // attempt to get trailers, racing against channel close
++    let trailers = tokio::select! {
++        biased;
++        t = client.read_trailers() => {
++            match t {
++                Ok(t) => t,
++                Err(e) => {
++                    let _ = tx.send(HttpTask::Failed(e.into_up())).await;
++                    return Ok(());
++                }
++            }
++        }
++        _ = tx.closed() => {
+             return Ok(());
+         }
+     };
